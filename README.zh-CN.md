@@ -68,6 +68,7 @@ cd github-landscape
 python scripts/gh.py --help
 python scripts/gh.py search "cli note taking" --top 30
 python scripts/gh.py search "cli note taking" --sort best
+python scripts/gh.py search "cli note taking" "terminal notes in:readme" --sort best --top 30
 python scripts/gh.py inspect owner/repo --max-issues 20 --readme-chars 4000
 python scripts/gh.py rate
 ```
@@ -76,7 +77,7 @@ python scripts/gh.py rate
 
 | 命令 | 输出 | 参数 |
 | --- | --- | --- |
-| `search "query"` | 包含仓库链接和元数据的 Markdown 候选表 | `--top`：默认 30，最多 100；`--sort`：`stars`（默认）、`best`、`forks` 或 `updated` |
+| `search "query" ["query" ...]` | 合并后的 Markdown 候选表，包含仓库链接、元数据与命中查询编号 | `--top`：每条查询默认 30，最多 100；`--sort`：`stars`（默认）、`best`、`forks` 或 `updated` |
 | `inspect owner/repo` | 仓库元数据、发布版本、默认分支提交、贡献者、README 摘要及 open issue 样本 | `--max-issues`：默认 20，最多 100 条 issue/PR 混合条目；`--readme-chars`：默认 4000 |
 | `rate` | core/search API 的剩余额度与重置时间 | 无参数 |
 
@@ -89,6 +90,10 @@ python scripts/gh.py inspect cli/cli > repository-sample.md
 ```
 
 脚本负责收集证据，不会自动筛选最终候选或撰写完整对比分析。
+
+多条查询分别执行后按仓库 ID 去重，保留首次出现的元数据与展示顺序，并用 `Q1`、`Q2` 等记录全部命中查询。去除首尾空白后相同的查询只执行一次。`--top` 对每条查询生效，不限制合并后的总数。命中次数仅表示来源，不是适配评分；各查询的结果总数有重叠，不能直接相加。
+
+某条查询失败时，输出仍保留成功结果，命令退出码为 1。查询本身的错误不阻止其他查询；连接、认证或限额耗尽等故障会停止后续查询并标记跳过。GitHub 的 `incomplete_results` 标记会单独提示；请求成功不代表检索覆盖完整。
 
 ## 调研结果包含什么
 
@@ -106,7 +111,7 @@ python scripts/gh.py inspect cli/cli > repository-sample.md
 - **release 属于样本：**仅将有发布时间的非草稿记录计为已确认发布，区分正式版和预发布，并在样本内按发布时间排序；不保证包含全仓库最新正式版。
 - **README 可能被截断：**缺少的信息仍属于未确认，关键判断可能需要补充调查。
 - **活跃度不是质量评分：**stars 表示关注度，push 日期表示活动时间，两者都不能单独证明质量、适配程度或停止维护。
-- **请求计数按命令统计：**无重试时，`search` 和 `rate` 各请求 1 次，完整执行 `inspect` 请求 6 次。每个端点最多尝试 5 次。2–4 次搜索加 3–5 次检查的基线为 20–34 次请求，补查和重试另计。脚本不自动跨命令汇总，也没有全流程预算硬限制。
+- **请求计数按命令统计：**无重试时，`search` 每条不同查询请求 1 次，`rate` 请求 1 次，完整执行 `inspect` 请求 6 次。每个端点最多尝试 5 次。2–4 条搜索查询加 3–5 次检查的基线为 20–34 次请求，补查和重试另计。脚本不自动跨命令汇总，也没有全流程预算硬限制。
 
 ## 项目结构
 
@@ -128,7 +133,7 @@ github-landscape/
 python -m unittest discover -s tests -v
 ```
 
-测试模拟 HTTP/API 调用，不需要联网或 token，覆盖样本解释、数据缺失、PR 过滤和请求计数；不验证 GitHub 实时可用性，也不代表已经验证智能体完整调研报告的质量。
+测试模拟 HTTP/API 调用，不需要联网或 token，覆盖多查询去重与来源保留、部分失败、样本解释、数据缺失、PR 过滤和请求计数；不验证 GitHub 实时可用性，也不代表已经验证智能体完整调研报告的质量。
 
 欢迎使用中文或英文提交 [Issue](https://github.com/ThinkDonk/github-landscape/issues) 和 [Pull Request](https://github.com/ThinkDonk/github-landscape/pulls)。反馈时请提供命令或调研提示词、预期结果与实际表现；证据判断问题请附来源链接。修改面向用户的行为时同步两份 README，修改脚本时补充有针对性的回归测试。分享日志前请去除 token。
 

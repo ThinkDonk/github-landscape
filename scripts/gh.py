@@ -4,7 +4,7 @@
 零依赖（仅 Python 标准库），匿名可用；设置 GITHUB_TOKEN 环境变量可提升限额。
 
 用法:
-  gh.py search "<query>" [--top 30] [--sort stars|best|forks|updated]
+  gh.py search "<query>" ["<query>" ...] [--top 30] [--sort stars|best|forks|updated]
   gh.py inspect <owner/repo> [--max-issues 20] [--readme-chars 4000]
   gh.py rate
 """
@@ -22,6 +22,12 @@ import urllib.request
 API = "https://api.github.com"
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 REQUEST_ATTEMPTS = 0
+
+
+class ApiError(Exception):
+    def __init__(self, message, stop=False):
+        super().__init__(message)
+        self.stop = stop
 
 
 def die(msg):
@@ -59,16 +65,19 @@ def api(path, params=None, raw=False):
                     wait = max(int(reset) - int(time.time()) + 1, 2) if reset else 30
                     if wait > 600:
                         at = dt.datetime.fromtimestamp(int(reset)).astimezone().strftime("%H:%M:%S")
-                        die(f"API 限额耗尽，{at} 重置（约 {wait // 60} 分钟）；届时重跑，或设置 GITHUB_TOKEN 提升限额")
+                        raise ApiError(f"API 限额耗尽，{at} 重置（约 {wait // 60} 分钟）；届时重跑，或设置 GITHUB_TOKEN 提升限额", stop=True)
                 else:
                     wait = 30
                 print(f"限速，等待 {wait}s 后重试…", file=sys.stderr)
                 time.sleep(wait)
                 continue
-            die(f"HTTP {e.code} {url}\n{e.read().decode('utf-8', 'replace')[:300]}")
+            raise ApiError(f"HTTP {e.code} {url}\n{e.read().decode('utf-8', 'replace')[:300]}",
+                           stop=e.code in (401, 403)) from e
         except urllib.error.URLError as e:
-            die(f"网络错误 {url}: {e.reason}")
-    die(f"重试次数用尽: {url}")
+            raise ApiError(f"网络错误 {url}: {e.reason}", stop=True) from e
+        except (TimeoutError, json.JSONDecodeError) as e:
+            raise ApiError(f"响应未取得或无法解析 {url}: {e}", stop=True) from e
+    raise ApiError(f"重试次数用尽: {url}", stop=True)
 
 
 def days_since(iso):
@@ -82,25 +91,77 @@ def cell(v):
     return str(v if v is not None else "?")
 
 
-def cmd_search(args):
-    params = {"q": args.query, "per_page": min(args.top, 100)}
-    if args.sort != "best":
-        params["sort"] = args.sort
-        params["order"] = "desc" if args.sort != "updated" else "desc"
-    data = api("/search/repositories", params)
-    items = data.get("items", [])
-    print(f"共 {data.get('total_count')} 个结果，取前 {len(items)}（query: {args.query}，sort: {args.sort}）\n")
+def collect_search(args):
+    queries = [args.query] if isinstance(args.query, str) else args.query
+    queries = list(dict.fromkeys(q.strip() for q in queries))
+    if not all(queries):
+        die("查询不能为空")
+    records, repositories = [], {}
+    stopped = None
+    for index, query in enumerate(queries, 1):
+        params = {"q": query, "per_page": min(args.top, 100)}
+        if args.sort != "best":
+            params.update(sort=args.sort, order="desc")
+        record = {"id": f"Q{index}", "query": query,
+                  "source_url": API + "/search/repositories?" + urllib.parse.urlencode(params)}
+        records.append(record)
+        if stopped:
+            record.update(status="skipped", error=stopped)
+            continue
+        try:
+            data = api("/search/repositories", params)
+            if data is None:
+                raise ApiError("搜索端点不存在或不可访问")
+        except ApiError as e:
+            record.update(status="error", error=str(e))
+            if e.stop:
+                stopped = "前一查询遇到连接、认证或限额问题，停止后续请求"
+            continue
+        items = data.get("items", [])
+        record.update(status="ok", total_count=data.get("total_count"),
+                      returned_count=len(items), incomplete_results=data.get("incomplete_results"),
+                      sample_limit=params["per_page"], paginated=False)
+        for item in items:
+            key = ("id", item["id"]) if item.get("id") is not None else ("name", item["full_name"].lower())
+            if key not in repositories:
+                repositories[key] = dict(item, matched_queries=[])
+            matches = repositories[key]["matched_queries"]
+            if record["id"] not in matches:
+                matches.append(record["id"])
+    successes = sum(r["status"] == "ok" for r in records)
+    return {"status": "ok" if successes == len(records) else "partial" if successes else "error",
+            "queries": records, "repositories": list(repositories.values()),
+            "unique_count": len(repositories), "sort": args.sort, "per_query_limit": min(args.top, 100)}
+
+
+def render_search(result):
+    for query in result["queries"]:
+        if query["status"] == "ok":
+            print(f"{query['id']}: 共 {query.get('total_count')} 个结果，取前 {query['returned_count']}（query: {query['query']}，sort: {result['sort']}）")
+            if query.get("incomplete_results"):
+                print("GitHub 标记本次搜索结果不完整。")
+        else:
+            print(f"{query['id']}: {query['status']}（query: {query['query']}）：{query['error']}")
+    items = result["repositories"]
+    print(f"\n合并去重后 {len(items)} 个仓库；每条查询仅取一页，按首次出现顺序展示。")
+    print("命中查询表示来源，不是功能适配评分；各查询总数不能相加作为唯一仓库总数。\n")
     if not items:
         return
-    print("| 仓库 | stars | forks | open issues+PR | push天数 | 存档 | license | 简介 |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| 仓库 | stars | forks | open issues+PR | push天数 | 存档 | license | 简介 | 命中查询 |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for it in items:
         desc = (it.get("description") or "").replace("|", "/").replace("\n", " ")[:80]
         lic = (it.get("license") or {}).get("spdx_id") or "-"
         arch = "已存档" if it.get("archived") else ""
         print(f"| [{it['full_name']}]({it['html_url']}) | {it['stargazers_count']} | "
               f"{it['forks_count']} | {it['open_issues_count']} | {cell(days_since(it.get('pushed_at')))} | "
-              f"{arch} | {lic} | {desc} |")
+              f"{arch} | {lic} | {desc} | {', '.join(it['matched_queries'])} |")
+
+
+def cmd_search(args):
+    result = collect_search(args)
+    render_search(result)
+    return 0 if result["status"] == "ok" else 1
 
 
 def cmd_inspect(args):
@@ -198,8 +259,8 @@ def main():
                                formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     ps = sub.add_parser("search", help="搜索仓库，输出候选池表格")
-    ps.add_argument("query")
-    ps.add_argument("--top", type=int, default=30)
+    ps.add_argument("query", nargs="+", help="一条或多条独立查询；每条用引号包裹")
+    ps.add_argument("--top", type=positive_int, default=30, help="每条查询取前多少条，最多 100（默认 30）")
     ps.add_argument("--sort", choices=["stars", "best", "forks", "updated"], default="stars")
     pi = sub.add_parser("inspect", help="拉取单个仓库的维护证据样本（6 次请求，不翻页）")
     pi.add_argument("repo", help="owner/repo")
@@ -209,9 +270,20 @@ def main():
     args = p.parse_args()
     before = REQUEST_ATTEMPTS
     try:
-        {"search": cmd_search, "inspect": cmd_inspect, "rate": cmd_rate}[args.cmd](args)
+        status = {"search": cmd_search, "inspect": cmd_inspect, "rate": cmd_rate}[args.cmd](args)
+        if status:
+            sys.exit(status)
+    except ApiError as e:
+        die(str(e))
     finally:
         print(f"HTTP 请求尝试：{REQUEST_ATTEMPTS - before} 次（含失败和限速重试）", file=sys.stderr)
+
+
+def positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须为正整数")
+    return number
 
 
 if __name__ == "__main__":

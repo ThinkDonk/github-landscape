@@ -124,6 +124,80 @@ class LandscapeTests(unittest.TestCase):
             gh.cmd_search(argparse.Namespace(query="example", top=30, sort="best"))
         self.assertIn("open issues+PR", stdout.getvalue())
 
+    def test_multi_query_deduplicates_by_id_and_preserves_all_sources(self):
+        first = dict(repository(), id=1)
+        renamed = dict(first, full_name="example/renamed")
+        other = dict(repository(), id=2, full_name="example/other")
+        values = [
+            {"items": [first, other], "total_count": 50, "incomplete_results": False},
+            {"items": [renamed], "total_count": 10, "incomplete_results": True},
+        ]
+        args = argparse.Namespace(query=["notes", "offline notes"], top=2, sort="best")
+        with mock.patch.object(gh, "api", side_effect=values) as fetch:
+            result = gh.collect_search(args)
+        self.assertEqual(result["unique_count"], 2)
+        self.assertEqual([r["full_name"] for r in result["repositories"]],
+                         ["example/project", "example/other"])
+        self.assertEqual(result["repositories"][0]["matched_queries"], ["Q1", "Q2"])
+        self.assertEqual(result["repositories"][1]["matched_queries"], ["Q1"])
+        self.assertEqual([q["total_count"] for q in result["queries"]], [50, 10])
+        self.assertTrue(result["queries"][1]["incomplete_results"])
+        self.assertEqual(fetch.call_args_list[1].args[1], {"q": "offline notes", "per_page": 2})
+        self.assertIn("q=offline+notes", result["queries"][1]["source_url"])
+
+    def test_repeated_queries_do_not_repeat_requests_or_attribution(self):
+        args = argparse.Namespace(query=[" notes ", "notes"], top=1000, sort="stars")
+        with mock.patch.object(gh, "api", return_value={"items": [repository()]}) as fetch:
+            result = gh.collect_search(args)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_args.args[1]["per_page"], 100)
+        self.assertEqual(result["repositories"][0]["matched_queries"], ["Q1"])
+
+    def test_query_failure_keeps_other_results_and_returns_nonzero(self):
+        invalid = gh.urllib.error.HTTPError("https://api.github.com/search/repositories",
+                                           422, "invalid query", {}, io.BytesIO(b"invalid"))
+        values = [response({"items": [repository()], "total_count": 1}), invalid,
+                  response({"items": [], "total_count": 0})]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(gh.urllib.request, "urlopen", side_effect=values) as fetch:
+            with mock.patch.object(gh.sys, "argv", ["gh.py", "search", "notes", "bad", "offline"]):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as error:
+                        gh.main()
+        self.assertEqual(error.exception.code, 1)
+        self.assertEqual(fetch.call_count, 3)
+        self.assertIn("example/project", stdout.getvalue())
+        self.assertIn("Q2: error", stdout.getvalue())
+        self.assertIn("Q3: 共 0 个结果", stdout.getvalue())
+        self.assertIn("HTTP 请求尝试：3 次", stderr.getvalue())
+
+    def test_connection_failure_stops_remaining_queries_with_explicit_status(self):
+        args = argparse.Namespace(query=["first", "second", "third"], top=30, sort="best")
+        with mock.patch.object(gh.urllib.request, "urlopen", side_effect=[
+            response({"items": [repository()]}), gh.urllib.error.URLError("offline")
+        ]) as fetch:
+            result = gh.collect_search(args)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual([q["status"] for q in result["queries"]], ["ok", "error", "skipped"])
+        self.assertEqual(result["unique_count"], 1)
+
+    def test_all_failed_queries_are_not_successful_empty_searches(self):
+        args = argparse.Namespace(query=["first", "second"], top=30, sort="best")
+        with mock.patch.object(gh, "api", return_value=None):
+            result = gh.collect_search(args)
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(all(q["status"] == "error" for q in result["queries"]))
+        self.assertTrue(all("total_count" not in q for q in result["queries"]))
+
+    def test_invalid_search_limits_and_blank_queries_do_not_call_api(self):
+        for arguments in (["search", "notes", "--top", "0"], ["search", " "]):
+            with self.subTest(arguments=arguments), mock.patch.object(gh, "api") as fetch:
+                with mock.patch.object(gh.sys, "argv", ["gh.py"] + arguments):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        gh.main()
+            fetch.assert_not_called()
+
     def test_missing_metadata_and_readme_do_not_imply_absence(self):
         for readme, expected in ((None, "README 未取得"), ("", "README 返回空内容")):
             with self.subTest(readme=readme):

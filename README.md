@@ -69,6 +69,7 @@ cd github-landscape
 python scripts/gh.py --help
 python scripts/gh.py search "cli note taking" --top 30
 python scripts/gh.py search "cli note taking" --sort best
+python scripts/gh.py search "cli note taking" "terminal notes in:readme" --sort best --top 30
 python scripts/gh.py inspect owner/repo --max-issues 20 --readme-chars 4000
 python scripts/gh.py rate
 ```
@@ -77,7 +78,7 @@ Replace `owner/repo` with a real repository, such as `cli/cli`. Use `python3` on
 
 | Command | Output | Options |
 | --- | --- | --- |
-| `search "query"` | Markdown candidate table with repository links and metadata | `--top`: default 30, capped at 100; `--sort`: `stars` (default), `best`, `forks`, or `updated` |
+| `search "query" ["query" ...]` | Merged Markdown candidate table with repository links, metadata, and matching query IDs | `--top`: per query, default 30, capped at 100; `--sort`: `stars` (default), `best`, `forks`, or `updated` |
 | `inspect owner/repo` | Repository metadata, releases, default-branch commits, contributors, a README excerpt, and open issue samples | `--max-issues`: default 20, capped at 100 mixed issue/PR entries; `--readme-chars`: default 4000 |
 | `rate` | Remaining core/search API quota and reset times | No options |
 
@@ -90,6 +91,10 @@ python scripts/gh.py inspect cli/cli > repository-sample.md
 ```
 
 The helper collects evidence; it does not automatically select a shortlist or write the final comparative analysis.
+
+Multiple queries are executed separately, then deduplicated by repository ID. The first occurrence supplies the metadata and display order; `Q1`, `Q2`, etc. preserve every matching query. Repeated identical queries (after trimming surrounding whitespace) run once. `--top` applies to each query, not the merged total. Query hit counts are provenance, not suitability scores; overlapping search totals must not be added together.
+
+If a query fails, successful results remain in the output and the command exits with code 1. Query-specific errors allow subsequent queries to continue; connection, authentication, or exhausted rate-limit failures stop remaining queries and mark them as skipped. GitHub's `incomplete_results` flag is surfaced separately; a successful request does not guarantee exhaustive coverage.
 
 ## Research output
 
@@ -107,7 +112,7 @@ When a file is requested, use the task's output directory. A suggested fallback 
 - **Releases are sampled:** only non-draft entries with publication timestamps count as confirmed published releases. Stable releases and prereleases are distinguished and sorted within the sample; the latest stable release across the whole repository is not guaranteed to be included.
 - **README content may be truncated:** missing details remain unconfirmed and may require additional research.
 - **Activity is not a quality score:** stars indicate attention and push dates indicate activity. Neither alone proves quality, suitability, or abandonment.
-- **Request accounting is per command:** without retries, `search` and `rate` make 1 request each; a complete `inspect` makes 6. Each endpoint allows at most 5 attempts. Two to four searches plus three to five inspections therefore have a baseline of 20–34 requests, excluding extra checks and retries. There is no automatic cross-command total or enforced workflow budget.
+- **Request accounting is per command:** without retries, `search` makes 1 request per distinct query, `rate` makes 1, and a complete `inspect` makes 6. Each endpoint allows at most 5 attempts. Two to four search queries plus three to five inspections therefore have a baseline of 20–34 requests, excluding extra checks and retries. There is no automatic cross-command total or enforced workflow budget.
 
 ## Project layout
 
@@ -129,7 +134,7 @@ Run the existing tests from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The tests mock HTTP/API calls and require no network access or token. They check sampled-evidence interpretation, missing data, PR filtering, and request accounting; they do not validate live GitHub availability or the quality of an agent's full research report.
+The tests mock HTTP/API calls and require no network access or token. They check multi-query deduplication and provenance, partial failures, sampled-evidence interpretation, missing data, PR filtering, and request accounting; they do not validate live GitHub availability or the quality of an agent's full research report.
 
 [Issues](https://github.com/ThinkDonk/github-landscape/issues) and [pull requests](https://github.com/ThinkDonk/github-landscape/pulls) in English or Chinese are welcome. Include the command or research prompt, expected and actual behavior, and source links when reporting an evidence problem. Keep both READMEs aligned when updating user-facing behavior, and add focused regression coverage for script changes. Remove tokens from shared logs.
 
