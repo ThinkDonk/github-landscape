@@ -73,6 +73,8 @@ python scripts/gh.py search "cli note taking" "terminal notes in:readme" --sort 
 python scripts/gh.py search "cli note taking" "terminal notes in:readme" --format json
 python scripts/gh.py inspect owner/repo --max-issues 20 --readme-chars 4000
 python scripts/gh.py inspect owner/repo --format json
+python scripts/gh.py issues owner/repo "resume download" --state all --top 20
+python scripts/gh.py issue owner/repo 123 --max-comments 20 --format json
 python scripts/gh.py rate
 ```
 
@@ -82,6 +84,8 @@ Replace `owner/repo` with a real repository, such as `cli/cli`. Use `python3` on
 | --- | --- | --- |
 | `search "query" ["query" ...]` | Merged Markdown candidate table with repository links, metadata, and matching query IDs | `--top`: per query, default 30, capped at 100; `--sort`: `stars` (default), `best`, `forks`, or `updated` |
 | `inspect owner/repo` | Repository metadata, releases, default-branch commits, contributors, a README excerpt, and open issue samples | `--max-issues`: default 20, capped at 100 mixed issue/PR entries; `--readme-chars`: default 4000 |
+| `issues owner/repo "keywords"` | Feature-related Issue search with body excerpts, states, dates, authors, and source links | `--state`: `all` (default), `open`, `closed`; `--top`: default 20, capped at 100; `--sort`: `best` (default), `updated`; `--body-chars`: default 2000 |
+| `issue owner/repo 123` | One selected Issue and its first page of comments | `--max-comments`: default 20, capped at 100; `--body-chars`: default 4000 for the Issue body and each comment |
 | `rate` | Remaining core/search API quota and reset times | `--format` as described below |
 
 All commands accept `--format markdown` (default) or `--format json`.
@@ -113,6 +117,21 @@ Standard output contains one JSON document; diagnostics and HTTP attempt counts 
 - **Inspection:** `repository`, `releases`, `commits`, `contributors`, `readme`, and `issues` contain `status`, `source_url`, `collected_at`, and `data`. Missing data is `null`, distinct from a successfully returned empty list or string. Section statuses are `ok`, `unavailable`, `error`, or `skipped`. Partial results are retained, with exit code 1 when any section is unavailable or fails.
 - **Samples:** list sections include `sample_limit`, `returned_count`, `paginated: false`, and `limit_reached`. A full page does not prove that another page exists. README includes `character_limit`, `original_characters`, and `truncated`. Issues preserve the mixed API count and `pull_requests_excluded`, while `data` contains only issues. Releases retain their original `draft`, `prerelease`, and publication fields; consumers must apply the publication rules below.
 - **Quota:** `rate_limit.data` contains GitHub's resource quota response with the same source/status metadata. Skipped endpoints have a `null` collection time because no request was made.
+- **Targeted Issues:** `issues` returns the effective `query` and an `issues` section with source/status metadata, counts, sampling flags, and Issue records in `data`. `issue` returns `issue` and `comments` sections. Body excerpts retain the original fields and add `body_character_limit`, `body_original_characters`, and `body_truncated`. Comments record `order: "id_asc"`, `reported_total` from the Issue metadata, and the returned sample size; comment-page `truncated` compares those two counts. Missing or unprovided bodies remain `null`; this is not the same as a returned empty string.
+
+### Investigate a specific feature
+
+```bash
+python scripts/gh.py issues cli/cli "extension" --state all --top 5
+python scripts/gh.py issues cli/cli "extension" --state closed --sort updated --format json
+python scripts/gh.py issue owner/repo 123 --max-comments 20 --body-chars 4000
+```
+
+First search a relevant repository with feature keywords, then replace `owner/repo` and `123` with the repository and Issue number you choose from the results. Search covers titles, bodies, and comments; results include the Issue body, not every matching comment. The command fixes the repository and Issue type, includes open and closed Issues by default, and excludes PRs. Use `--state` to narrow the state. Scope/type/state/field overrides (`repo:`, `org:`, `user:`, `is:`, `type:`, `state:`, `in:`) and Boolean operators (`AND`, `OR`, `NOT`) are rejected; search synonyms separately.
+
+Only fetch a selected Issue's comments when they could change the conclusion. The comment endpoint returns the first page in ascending ID order, so it may omit later replies or the final decision. Increase the sample/character limit or follow the source link when needed. `closed` and `state_reason` alone do not prove a fix, a release, or feature support. No match does not prove absence; a report does not establish reproduction or frequency. A PR number is rejected by `issue`, and a failed comment request preserves the Issue body with `status: partial` and exit code 1.
+
+API references: [Issue search](https://docs.github.com/en/rest/search/search#search-issues-and-pull-requests), [Issue details](https://docs.github.com/en/rest/issues/issues#get-an-issue), and [Issue comments](https://docs.github.com/en/rest/issues/comments#list-issue-comments).
 
 ## Research output
 
@@ -124,13 +143,13 @@ When a file is requested, use the task's output directory. A suggested fallback 
 
 ## Evidence and API limits
 
-- **No pagination:** search and inspection collect limited samples. Inspection requests up to 5 releases, 15 default-branch commits, 10 contributors, a README excerpt, and one open issue/PR page.
+- **No pagination:** repository search, inspection, targeted Issue search, and comment retrieval collect limited samples. Inspection requests up to 5 releases, 15 default-branch commits, 10 contributors, a README excerpt, and one open issue/PR page.
 - **Issues include pull requests:** GitHub's `open_issues_count` includes PRs. `--max-issues` limits mixed entries before PRs are filtered out; an empty filtered page does not mean the repository has no open issues.
 - **Issue reports are individual reports:** samples ordered by recent updates cannot establish defect frequency or prove a reported bug was reproduced.
 - **Releases are sampled:** only non-draft entries with publication timestamps count as confirmed published releases. Stable releases and prereleases are distinguished and sorted within the sample; the latest stable release across the whole repository is not guaranteed to be included.
 - **README content may be truncated:** missing details remain unconfirmed and may require additional research.
 - **Activity is not a quality score:** stars indicate attention and push dates indicate activity. Neither alone proves quality, suitability, or abandonment.
-- **Request accounting is per command:** without retries, `search` makes 1 request per distinct query, `rate` makes 1, and a complete `inspect` makes 6. Each endpoint allows at most 5 attempts. Two to four search queries plus three to five inspections therefore have a baseline of 20–34 requests, excluding extra checks and retries. There is no automatic cross-command total or enforced workflow budget.
+- **Request accounting is per command:** without retries, `search` makes 1 request per distinct query, `rate` and `issues` make 1 each, a complete `inspect` makes 6, and `issue` makes at most 2 (Issue plus comments). Each endpoint allows at most 5 attempts. Two to four search queries plus three to five inspections therefore have a baseline of 20–34 requests, excluding targeted Issue checks, other extra checks, and retries. There is no automatic cross-command total or enforced workflow budget.
 
 ## Project layout
 
@@ -152,7 +171,7 @@ Run the existing tests from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The tests mock HTTP/API calls and require no network access or token. They check multi-query deduplication and provenance, JSON parsing and evidence boundaries, partial failures, sampled-evidence interpretation, missing data, PR filtering, and request accounting; they do not validate live GitHub availability or the quality of an agent's full research report.
+The tests mock HTTP/API calls and require no network access or token. They check multi-query deduplication and provenance, JSON parsing and evidence boundaries, targeted Issue queries and comment sampling, partial failures, sampled-evidence interpretation, missing data, PR filtering, and request accounting; they do not validate live GitHub availability or the quality of an agent's full research report.
 
 [Issues](https://github.com/ThinkDonk/github-landscape/issues) and [pull requests](https://github.com/ThinkDonk/github-landscape/pulls) in English or Chinese are welcome. Include the command or research prompt, expected and actual behavior, and source links when reporting an evidence problem. Keep both READMEs aligned when updating user-facing behavior, and add focused regression coverage for script changes. Remove tokens from shared logs.
 

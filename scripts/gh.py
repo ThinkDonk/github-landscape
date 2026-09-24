@@ -6,15 +6,18 @@
 用法:
   gh.py search "<query>" ["<query>" ...] [--top 30] [--sort stars|best|forks|updated]
   gh.py inspect <owner/repo> [--max-issues 20] [--readme-chars 4000]
+  gh.py issues <owner/repo> "<keywords>" [--state all|open|closed] [--top 20]
+  gh.py issue <owner/repo> <number> [--max-comments 20] [--body-chars 4000]
   gh.py rate
 
-search / inspect / rate 均支持 --format markdown|json（默认 markdown）。
+所有命令均支持 --format markdown|json（默认 markdown）。
 """
 
 import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -333,6 +336,143 @@ def cmd_inspect(args):
     return emit_result("inspect", args, result, render_inspect, before)
 
 
+def excerpt_body(item, limit):
+    """保留原始字段，仅截断正文，并明确标记字符范围。"""
+    body = item.get("body")
+    return dict(item, body=body[:limit] if body is not None else None,
+                body_character_limit=limit,
+                body_original_characters=len(body) if body is not None else None,
+                body_truncated=len(body) > limit if body is not None else None)
+
+
+def collect_issues(args):
+    query = f"{args.keywords} repo:{args.repo} is:issue in:title,body,comments"
+    if args.state != "all":
+        query += f" state:{args.state}"
+    params = {"q": query, "per_page": min(args.top, 100)}
+    if args.sort != "best":
+        params.update(sort=args.sort, order="desc")
+    record = EvidenceCollector().fetch("/search/issues", params)
+    result = {"repo": args.repo, "keywords": args.keywords, "query": query,
+              "state": args.state, "sort": args.sort, "issues": record,
+              "status": "ok" if record["status"] == "ok" else "error"}
+    record.update(sample_limit=params["per_page"], paginated=False)
+    if record["status"] == "ok":
+        data = record["data"]
+        items = data.get("items", [])
+        issues = [excerpt_body(i, args.body_chars) for i in items if "pull_request" not in i]
+        record.update(data=issues, total_count=data.get("total_count"), returned_count=len(items),
+                      issue_count=len(issues), pull_requests_excluded=len(items) - len(issues),
+                      incomplete_results=data.get("incomplete_results"),
+                      truncated=data["total_count"] > len(items) if isinstance(data.get("total_count"), int) else None)
+    return result
+
+
+def render_body(item):
+    body = item.get("body")
+    print("正文摘录：")
+    if body is None:
+        print("正文为空或未提供，内容未确认。")
+    elif not body:
+        print("正文返回空文本。")
+    else:
+        for line in body.splitlines():
+            print(f"> {line}")
+        if item["body_truncated"]:
+            print(f"…（已截断：前 {item['body_character_limit']} / {item['body_original_characters']} 字符）")
+
+
+def render_issue_item(item):
+    print(f"## [#{item['number']}]({item['html_url']}) {item['title']}")
+    author = (item.get("user") or {}).get("login") or "未确认"
+    print(f"状态 {item.get('state', '未确认')} | 关闭原因 {item.get('state_reason') or '未确认'} | "
+          f"作者 {author}（{item.get('author_association') or '关联未确认'}）")
+    print(f"创建 {item.get('created_at') or '?'} | 更新 {item.get('updated_at') or '?'} | "
+          f"关闭 {item.get('closed_at') or '-'} | 评论数 {cell(item.get('comments'))}")
+    labels = ", ".join(label["name"] for label in item.get("labels", []))
+    if labels:
+        print(f"标签：{labels}")
+    render_body(item)
+    print()
+
+
+def render_issues(result):
+    print(f"# 功能相关 Issue：{result['repo']}")
+    print(f"查询：{result['query']}\n")
+    record = result["issues"]
+    if record["status"] != "ok":
+        print(f"未取得 Issue 检索结果：{record['error']}")
+        return
+    print(f"API 匹配总数 {record.get('total_count')}；本页返回 {record['returned_count']} 条，保留 {record['issue_count']} 条 Issue。")
+    print("仅当前页，未翻页；个案不能证明问题频率或已经复现，closed 不等于已修复。")
+    if record.get("incomplete_results"):
+        print("GitHub 标记本次搜索结果不完整。")
+    if not record["data"]:
+        print("当前查询没有取得 Issue 样本；不能据此判断功能不存在或没有相关问题。")
+    for item in record["data"]:
+        render_issue_item(item)
+
+
+def cmd_issues(args):
+    before = REQUEST_ATTEMPTS
+    return emit_result("issues", args, collect_issues(args), render_issues, before)
+
+
+def collect_issue(args):
+    base = f"/repos/{args.repo}/issues/{args.number}"
+    collector = EvidenceCollector()
+    record = collector.fetch(base)
+    result = {"repo": args.repo, "number": args.number, "issue": record}
+    if record["status"] != "ok":
+        return dict(result, status="error")
+    item = record["data"]
+    if "pull_request" in item:
+        record.update(status="error", error="该编号是 pull request，不是 Issue；请使用 Issue 编号")
+        return dict(result, status="error")
+    record["data"] = excerpt_body(item, args.body_chars)
+    comments = collector.fetch(base + "/comments", {"per_page": min(args.max_comments, 100)})
+    result["comments"] = comments
+    comments.update(sample_limit=min(args.max_comments, 100), paginated=False, order="id_asc",
+                    reported_total=item.get("comments"))
+    if comments["status"] == "ok":
+        entries = comments["data"]
+        total = item.get("comments")
+        comments.update(data=[excerpt_body(c, args.body_chars) for c in entries], returned_count=len(entries),
+                        limit_reached=len(entries) == comments["sample_limit"],
+                        truncated=total > len(entries) if isinstance(total, int) else None)
+    result["status"] = "ok" if comments["status"] == "ok" else "partial"
+    return result
+
+
+def render_issue(result):
+    record = result["issue"]
+    if record["status"] != "ok":
+        print(f"错误: {record['error']}", file=sys.stderr)
+        return
+    print(f"# Issue 取证：{result['repo']}\n")
+    print("这是个案与讨论原文；closed / state_reason 不单独证明已修复或某版本支持。\n")
+    render_issue_item(record["data"])
+    comments = result["comments"]
+    if comments["status"] != "ok":
+        print(f"## 评论未取得：{comments['error']}")
+        return
+    print(f"## 评论样本（取得 {comments['returned_count']} 条；Issue 元数据报告 {cell(comments['reported_total'])} 条）")
+    print("按 ID 升序取第一页，未翻页；不是最新评论，可能未包含最终结论。")
+    if comments.get("truncated"):
+        print("评论样本未覆盖元数据所报告的全部评论。")
+    for comment in comments["data"]:
+        author = (comment.get("user") or {}).get("login") or "未确认"
+        print(f"### [评论 {comment['id']}]({comment['html_url']}) — {author}（{comment.get('author_association') or '关联未确认'}）")
+        print(f"创建 {comment.get('created_at') or '?'} | 更新 {comment.get('updated_at') or '?'}")
+        render_body(comment)
+        print()
+
+
+def cmd_issue(args):
+    before = REQUEST_ATTEMPTS
+    return emit_result("issue", args, collect_issue(args), render_issue, before)
+
+
 def render_rate(result):
     if result["rate_limit"]["status"] != "ok":
         print(f"错误: {result['rate_limit']['error']}", file=sys.stderr)
@@ -363,16 +503,29 @@ def main():
     ps.add_argument("--top", type=positive_int, default=30, help="每条查询取前多少条，最多 100（默认 30）")
     ps.add_argument("--sort", choices=["stars", "best", "forks", "updated"], default="stars")
     pi = sub.add_parser("inspect", help="拉取单个仓库的维护证据样本（6 次请求，不翻页）")
-    pi.add_argument("repo", help="owner/repo")
+    pi.add_argument("repo", type=repository_name, help="owner/repo")
     pi.add_argument("--max-issues", type=positive_int, default=20, help="单页 issue/PR 混合样本条数，最多 100（默认 20）")
     pi.add_argument("--readme-chars", type=positive_int, default=4000)
+    pis = sub.add_parser("issues", help="按功能关键词搜索指定仓库的 Issue（1 次请求，不翻页）")
+    pis.add_argument("repo", type=repository_name, help="owner/repo")
+    pis.add_argument("keywords", type=feature_keywords, help="功能关键词或短语；仓库、类型、状态和搜索字段由命令限定")
+    pis.add_argument("--state", choices=["all", "open", "closed"], default="all")
+    pis.add_argument("--top", type=positive_int, default=20, help="单页条数，最多 100（默认 20）")
+    pis.add_argument("--sort", choices=["best", "updated"], default="best")
+    pis.add_argument("--body-chars", type=positive_int, default=2000, help="每条正文的字符上限（默认 2000）")
+    pid = sub.add_parser("issue", help="读取选中 Issue 的正文与第一页评论（最多 2 次请求，不翻页）")
+    pid.add_argument("repo", type=repository_name, help="owner/repo")
+    pid.add_argument("number", type=positive_int, help="Issue 编号，不含 #")
+    pid.add_argument("--max-comments", type=positive_int, default=20, help="首个评论页的条数，最多 100（默认 20）")
+    pid.add_argument("--body-chars", type=positive_int, default=4000, help="正文及每条评论的字符上限（默认 4000）")
     pr = sub.add_parser("rate", help="查看 API 限额")
-    for parser in (ps, pi, pr):
+    for parser in (ps, pi, pis, pid, pr):
         parser.add_argument("--format", choices=["markdown", "json"], default="markdown", help="输出格式（默认 markdown）")
     args = p.parse_args()
     before = REQUEST_ATTEMPTS
     try:
-        status = {"search": cmd_search, "inspect": cmd_inspect, "rate": cmd_rate}[args.cmd](args)
+        status = {"search": cmd_search, "inspect": cmd_inspect, "issues": cmd_issues,
+                  "issue": cmd_issue, "rate": cmd_rate}[args.cmd](args)
         if status:
             sys.exit(status)
     except ApiError as e:
@@ -386,6 +539,23 @@ def positive_int(value):
     if number <= 0:
         raise argparse.ArgumentTypeError("必须为正整数")
     return number
+
+
+def repository_name(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", value) or value.split("/")[-1] in (".", ".."):
+        raise argparse.ArgumentTypeError("仓库格式应为 owner/repo，不能包含 URL、查询参数或路径")
+    return value
+
+
+def feature_keywords(value):
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("功能关键词不能为空")
+    if re.search(r"\b(?:repo|org|user|is|type|state|in)\s*:", value, re.IGNORECASE):
+        raise argparse.ArgumentTypeError("关键词不能覆盖仓库、类型、状态或搜索字段；状态请使用 --state")
+    if re.search(r"\b(?:AND|OR|NOT)\b", value):
+        raise argparse.ArgumentTypeError("请使用功能关键词或短语，不支持布尔运算符；同义词可分别搜索")
+    return value
 
 
 if __name__ == "__main__":

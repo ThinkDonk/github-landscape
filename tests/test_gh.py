@@ -37,6 +37,15 @@ def response(value):
     return result
 
 
+def issue_sample(number=7, state="closed"):
+    return {"number": number, "title": "Resume interrupted download", "body": "断点续传尚未实现",
+            "html_url": f"https://github.com/example/project/issues/{number}",
+            "state": state, "state_reason": "not_planned" if state == "closed" else None,
+            "comments": 3, "user": {"login": "reporter"}, "author_association": "NONE",
+            "created_at": "2025-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "closed_at": "2026-01-01T00:00:00Z" if state == "closed" else None}
+
+
 class LandscapeTests(unittest.TestCase):
     def setUp(self):
         gh.REQUEST_ATTEMPTS = 0
@@ -294,6 +303,137 @@ class LandscapeTests(unittest.TestCase):
         self.assertEqual(document["command"], "rate")
         self.assertEqual(document["rate_limit"]["data"], value)
         self.assertEqual(document["request_attempts"], 1)
+
+    def test_feature_issue_search_scopes_repository_includes_closed_and_excludes_prs(self):
+        document, _, fetch = self.json_command(["issues", "example/project", "断点续传", "--body-chars", "4"], [
+            response({"total_count": 10, "incomplete_results": True,
+                      "items": [issue_sample(), issue_sample(8, "open"), {"number": 9, "pull_request": {}}]})
+        ])
+        url = fetch.call_args.args[0].full_url
+        params = gh.urllib.parse.parse_qs(gh.urllib.parse.urlsplit(url).query)
+        self.assertEqual(params["q"], ["断点续传 repo:example/project is:issue in:title,body,comments"])
+        self.assertNotIn("sort", params)
+        self.assertEqual(document["request_attempts"], 1)
+        self.assertEqual(document["state"], "all")
+        section = document["issues"]
+        self.assertEqual([i["state"] for i in section["data"]], ["closed", "open"])
+        self.assertEqual(section["data"][0]["state_reason"], "not_planned")
+        self.assertEqual(section["data"][0]["body"], "断点续传")
+        self.assertTrue(section["data"][0]["body_truncated"])
+        self.assertEqual(section["data"][0]["html_url"], issue_sample()["html_url"])
+        self.assertEqual(section["data"][0]["updated_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(section["pull_requests_excluded"], 1)
+        self.assertTrue(section["truncated"])
+        self.assertTrue(section["incomplete_results"])
+
+    def test_feature_issue_state_sort_and_page_limit_are_sent_to_github(self):
+        document, _, fetch = self.json_command([
+            "issues", "example/project", '"offline sync"', "--state", "closed", "--sort", "updated", "--top", "1000"
+        ], [response({"items": [], "total_count": 0, "incomplete_results": False})])
+        params = gh.urllib.parse.parse_qs(gh.urllib.parse.urlsplit(fetch.call_args.args[0].full_url).query)
+        self.assertEqual(params["q"], ['"offline sync" repo:example/project is:issue in:title,body,comments state:closed'])
+        self.assertEqual(params["sort"], ["updated"])
+        self.assertEqual(params["per_page"], ["100"])
+        self.assertNotIn("page", params)
+        self.assertEqual(document["issues"]["data"], [])
+        self.assertEqual(document["status"], "ok")
+
+    def test_issue_input_cannot_override_repository_type_state_or_fields(self):
+        queries = [" ", "resume repo:other/project", "resume is:pr", "resume state:open",
+                   "resume in:title", "resume OR unrelated", "resume user:someone"]
+        arguments = [["issues", "example/project", query] for query in queries]
+        arguments += [["issues", "example/project?x=1", "sync"], ["issue", "example/project", "0"],
+                      ["issue", "example/project", "7", "--max-comments", "0"]]
+        for command in arguments:
+            with self.subTest(command=command), mock.patch.object(gh, "api") as fetch:
+                with mock.patch.object(gh.sys, "argv", ["gh.py"] + command):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        gh.main()
+                fetch.assert_not_called()
+
+    def test_failed_issue_search_does_not_become_an_empty_match(self):
+        document, _, _ = self.json_command(["issues", "example/project", "sync"], [
+            gh.urllib.error.URLError("offline")
+        ], expected_exit=1)
+        self.assertEqual(document["status"], "error")
+        self.assertIsNone(document["issues"]["data"])
+        self.assertNotIn("total_count", document["issues"])
+
+    def test_issue_detail_preserves_comment_sources_and_marks_sampling(self):
+        comment = {"id": 11, "html_url": "https://github.com/example/project/issues/7#issuecomment-11",
+                   "body": "请参考后续讨论", "user": {"login": "maintainer"}, "author_association": "MEMBER",
+                   "created_at": "2025-02-01T00:00:00Z", "updated_at": "2025-02-02T00:00:00Z"}
+        document, _, fetch = self.json_command([
+            "issue", "example/project", "7", "--max-comments", "1", "--body-chars", "3"
+        ], [response(issue_sample()), response([comment])])
+        self.assertEqual(document["request_attempts"], 2)
+        self.assertEqual(document["issue"]["data"]["state_reason"], "not_planned")
+        self.assertEqual(document["issue"]["data"]["body"], "断点续")
+        self.assertTrue(document["issue"]["data"]["body_truncated"])
+        comments = document["comments"]
+        self.assertEqual(comments["order"], "id_asc")
+        self.assertEqual(comments["reported_total"], 3)
+        self.assertTrue(comments["truncated"])
+        self.assertFalse(comments["paginated"])
+        self.assertEqual(comments["data"][0]["html_url"], comment["html_url"])
+        self.assertEqual(comments["data"][0]["user"]["login"], "maintainer")
+        self.assertEqual(comments["data"][0]["body"], "请参考")
+        self.assertEqual(comments["data"][0]["created_at"], comment["created_at"])
+        self.assertTrue(fetch.call_args.args[0].full_url.endswith("/issues/7/comments?per_page=1"))
+
+    def test_issue_detail_comment_failure_keeps_issue_evidence(self):
+        document, _, _ = self.json_command(["issue", "example/project", "7"], [
+            response(issue_sample()), gh.urllib.error.URLError("offline")
+        ], expected_exit=1)
+        self.assertEqual(document["status"], "partial")
+        self.assertEqual(document["issue"]["data"]["body"], issue_sample()["body"])
+        self.assertEqual(document["comments"]["status"], "error")
+        self.assertIsNone(document["comments"]["data"])
+        self.assertNotIn("returned_count", document["comments"])
+
+    def test_issue_detail_rejects_pull_request_without_fetching_comments(self):
+        document, _, fetch = self.json_command(["issue", "example/project", "9"], [
+            response(dict(issue_sample(9), pull_request={"url": "https://api.github.com/example"}))
+        ], expected_exit=1)
+        self.assertEqual(document["status"], "error")
+        self.assertEqual(fetch.call_count, 1)
+        self.assertNotIn("comments", document)
+        self.assertIn("pull request", document["issue"]["error"])
+
+    def test_issue_detail_missing_issue_does_not_fetch_comments(self):
+        missing = gh.urllib.error.HTTPError("https://api.github.com/example", 404, "missing", {}, io.BytesIO())
+        document, _, fetch = self.json_command(["issue", "example/project", "7"], [missing], expected_exit=1)
+        self.assertEqual(document["issue"]["status"], "unavailable")
+        self.assertEqual(fetch.call_count, 1)
+        self.assertNotIn("comments", document)
+
+    def test_issue_markdown_retains_closed_context_and_comment_caveat(self):
+        comment = {"id": 11, "html_url": "https://github.com/example/project/issues/7#issuecomment-11",
+                   "body": "No release planned.", "user": {"login": "maintainer"}}
+        stdout = io.StringIO()
+        args = argparse.Namespace(repo="example/project", number=7, max_comments=20, body_chars=4000)
+        with mock.patch.object(gh, "api", side_effect=[issue_sample(), [comment]]):
+            with contextlib.redirect_stdout(stdout):
+                gh.cmd_issue(args)
+        output = stdout.getvalue()
+        self.assertIn("not_planned", output)
+        self.assertIn("断点续传尚未实现", output)
+        self.assertIn(comment["html_url"], output)
+        self.assertIn("No release planned.", output)
+        self.assertIn("不单独证明已修复", output)
+        self.assertIn("可能未包含最终结论", output)
+
+    def test_issue_empty_and_missing_bodies_are_distinct(self):
+        document, _, fetch = self.json_command(["issue", "example/project", "7", "--max-comments", "1000"], [
+            response(dict(issue_sample(), body=None, comments=1)),
+            response([{"id": 1, "html_url": "https://example.test/comment/1", "body": ""}]),
+        ])
+        self.assertIsNone(document["issue"]["data"]["body"])
+        self.assertIsNone(document["issue"]["data"]["body_truncated"])
+        self.assertEqual(document["comments"]["data"][0]["body"], "")
+        self.assertFalse(document["comments"]["data"][0]["body_truncated"])
+        self.assertFalse(document["comments"]["truncated"])
+        self.assertTrue(fetch.call_args.args[0].full_url.endswith("per_page=100"))
 
     def test_missing_metadata_and_readme_do_not_imply_absence(self):
         for readme, expected in ((None, "README 未取得"), ("", "README 返回空内容")):

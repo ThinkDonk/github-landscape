@@ -72,6 +72,8 @@ python scripts/gh.py search "cli note taking" "terminal notes in:readme" --sort 
 python scripts/gh.py search "cli note taking" "terminal notes in:readme" --format json
 python scripts/gh.py inspect owner/repo --max-issues 20 --readme-chars 4000
 python scripts/gh.py inspect owner/repo --format json
+python scripts/gh.py issues owner/repo "resume download" --state all --top 20
+python scripts/gh.py issue owner/repo 123 --max-comments 20 --format json
 python scripts/gh.py rate
 ```
 
@@ -81,6 +83,8 @@ python scripts/gh.py rate
 | --- | --- | --- |
 | `search "query" ["query" ...]` | 合并后的 Markdown 候选表，包含仓库链接、元数据与命中查询编号 | `--top`：每条查询默认 30，最多 100；`--sort`：`stars`（默认）、`best`、`forks` 或 `updated` |
 | `inspect owner/repo` | 仓库元数据、发布版本、默认分支提交、贡献者、README 摘要及 open issue 样本 | `--max-issues`：默认 20，最多 100 条 issue/PR 混合条目；`--readme-chars`：默认 4000 |
+| `issues owner/repo "keywords"` | 按功能搜索 Issue，返回正文摘录、状态、时间、作者与来源链接 | `--state`：`all`（默认）、`open`、`closed`；`--top`：默认 20，最多 100；`--sort`：`best`（默认）、`updated`；`--body-chars`：默认 2000 |
+| `issue owner/repo 123` | 选中 Issue 的正文与第一页评论 | `--max-comments`：默认 20，最多 100；`--body-chars`：正文及每条评论默认各截取 4000 字符 |
 | `rate` | core/search API 的剩余额度与重置时间 | 支持下文的 `--format` |
 
 所有命令均支持 `--format markdown`（默认）或 `--format json`。
@@ -112,6 +116,21 @@ python scripts/gh.py inspect cli/cli --format json > repository-sample.json
 - **检查：**`repository`、`releases`、`commits`、`contributors`、`readme`、`issues` 各自包含 `status`、`source_url`、`collected_at` 和 `data`。未取得的数据为 `null`，与成功返回的空列表或空文本不同。分节状态为 `ok`、`unavailable`、`error` 或 `skipped`。保留已取得的部分结果；任一分节不可访问或失败时退出码为 1。
 - **样本：**列表分节记录 `sample_limit`、`returned_count`、`paginated: false` 和 `limit_reached`。满页不能证明还有下一页。README 记录 `character_limit`、`original_characters` 与 `truncated`。Issues 保留 API 混合返回数和 `pull_requests_excluded`，`data` 仅包含 issue。Releases 保留原始 `draft`、`prerelease` 与发布字段，使用方仍须遵守下文的发布判断规则。
 - **额度：**`rate_limit.data` 保存 GitHub 的资源额度响应，并带有相同的来源/状态信息。跳过的端点未发起请求，采集时间为 `null`。
+- **定向 Issue：**`issues` 返回实际执行的 `query`，以及包含来源/状态、计数、样本标记和 `data` 条目的 `issues` 分节。`issue` 返回 `issue` 与 `comments` 分节。正文摘录保留原始字段，并增加 `body_character_limit`、`body_original_characters`、`body_truncated`。评论记录 `order: "id_asc"`、Issue 元数据中的 `reported_total` 及返回样本数，评论页的 `truncated` 比较这两个数量。缺失或未提供的正文为 `null`，与返回空字符串不同。
+
+### 针对某项功能取证
+
+```bash
+python scripts/gh.py issues cli/cli "extension" --state all --top 5
+python scripts/gh.py issues cli/cli "extension" --state closed --sort updated --format json
+python scripts/gh.py issue owner/repo 123 --max-comments 20 --body-chars 4000
+```
+
+先在相关仓库中按功能关键词检索，再将 `owner/repo` 和 `123` 替换为从结果中选出的仓库与 Issue 编号。搜索范围包括标题、正文和评论；结果包含 Issue 正文，不会返回所有命中评论。命令固定仓库与 Issue 类型，默认同时包含 open、closed，并排除 PR。可通过 `--state` 缩小状态范围。不允许关键词覆盖仓库/类型/状态/搜索字段（`repo:`、`org:`、`user:`、`is:`、`type:`、`state:`、`in:`），也不支持布尔运算符（`AND`、`OR`、`NOT`）；同义词请分别搜索。
+
+仅在评论会改变判断时读取选中 Issue 的讨论。评论端点按 ID 升序返回第一页，可能缺少后续回复或最终决定；需要时增加样本/字符上限，或沿来源链接补查。`closed` 与 `state_reason` 不能单独证明已修复、已发布或功能已支持。未命中不代表不存在，个案也不证明已复现或问题频率。`issue` 会拒绝 PR 编号；评论请求失败时仍保留 Issue 正文，状态为 `partial`，退出码为 1。
+
+底层 API 说明：[Issue 搜索](https://docs.github.com/en/rest/search/search#search-issues-and-pull-requests)、[Issue 详情](https://docs.github.com/en/rest/issues/issues#get-an-issue)、[Issue 评论](https://docs.github.com/en/rest/issues/comments#list-issue-comments)。
 
 ## 调研结果包含什么
 
@@ -123,13 +142,13 @@ python scripts/gh.py inspect cli/cli --format json > repository-sample.json
 
 ## 证据与 API 边界
 
-- **不翻页：**搜索和检查仅获取有限样本。检查最多请求 5 条 release、15 条默认分支提交、10 位贡献者、一段 README 和一页 open issue/PR。
+- **不翻页：**仓库搜索、检查、定向 Issue 搜索和评论读取仅获取有限样本。检查最多请求 5 条 release、15 条默认分支提交、10 位贡献者、一段 README 和一页 open issue/PR。
 - **issue 计数包含 PR：**GitHub 的 `open_issues_count` 包含 PR。`--max-issues` 限制过滤前的混合条目数；过滤后为空，不代表仓库没有 open issue。
 - **issue 属于个案报告：**按最近更新时间抽样，不能推导问题发生频率，也不能证明报告中的问题已经复现。
 - **release 属于样本：**仅将有发布时间的非草稿记录计为已确认发布，区分正式版和预发布，并在样本内按发布时间排序；不保证包含全仓库最新正式版。
 - **README 可能被截断：**缺少的信息仍属于未确认，关键判断可能需要补充调查。
 - **活跃度不是质量评分：**stars 表示关注度，push 日期表示活动时间，两者都不能单独证明质量、适配程度或停止维护。
-- **请求计数按命令统计：**无重试时，`search` 每条不同查询请求 1 次，`rate` 请求 1 次，完整执行 `inspect` 请求 6 次。每个端点最多尝试 5 次。2–4 条搜索查询加 3–5 次检查的基线为 20–34 次请求，补查和重试另计。脚本不自动跨命令汇总，也没有全流程预算硬限制。
+- **请求计数按命令统计：**无重试时，`search` 每条不同查询请求 1 次，`rate` 和 `issues` 各请求 1 次，完整执行 `inspect` 请求 6 次，`issue` 最多请求 2 次（正文与评论）。每个端点最多尝试 5 次。2–4 条搜索查询加 3–5 次检查的基线为 20–34 次请求，定向 Issue 取证、其他补查与重试另计。脚本不自动跨命令汇总，也没有全流程预算硬限制。
 
 ## 项目结构
 
@@ -151,7 +170,7 @@ github-landscape/
 python -m unittest discover -s tests -v
 ```
 
-测试模拟 HTTP/API 调用，不需要联网或 token，覆盖多查询去重与来源保留、JSON 解析与证据边界、部分失败、样本解释、数据缺失、PR 过滤和请求计数；不验证 GitHub 实时可用性，也不代表已经验证智能体完整调研报告的质量。
+测试模拟 HTTP/API 调用，不需要联网或 token，覆盖多查询去重与来源保留、JSON 解析与证据边界、定向 Issue 查询与评论采样、部分失败、样本解释、数据缺失、PR 过滤和请求计数；不验证 GitHub 实时可用性，也不代表已经验证智能体完整调研报告的质量。
 
 欢迎使用中文或英文提交 [Issue](https://github.com/ThinkDonk/github-landscape/issues) 和 [Pull Request](https://github.com/ThinkDonk/github-landscape/pulls)。反馈时请提供命令或调研提示词、预期结果与实际表现；证据判断问题请附来源链接。修改面向用户的行为时同步两份 README，修改脚本时补充有针对性的回归测试。分享日志前请去除 token。
 
