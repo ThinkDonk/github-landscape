@@ -7,6 +7,8 @@
   gh.py search "<query>" ["<query>" ...] [--top 30] [--sort stars|best|forks|updated]
   gh.py inspect <owner/repo> [--max-issues 20] [--readme-chars 4000]
   gh.py rate
+
+search / inspect / rate 均支持 --format markdown|json（默认 markdown）。
 """
 
 import argparse
@@ -91,6 +93,46 @@ def cell(v):
     return str(v if v is not None else "?")
 
 
+def timestamp():
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def source_url(path, params=None):
+    return API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+
+
+class EvidenceCollector:
+    """保留每个端点的取证状态，系统性故障后不再发起请求。"""
+
+    def __init__(self):
+        self.stopped = None
+
+    def fetch(self, path, params=None, raw=False):
+        record = {"source_url": source_url(path, params), "collected_at": None, "data": None}
+        if self.stopped:
+            return dict(record, status="skipped", error=self.stopped)
+        record["collected_at"] = timestamp()
+        try:
+            data = api(path, params, raw=raw)
+        except ApiError as e:
+            if e.stop:
+                self.stopped = "前一请求遇到连接、认证或限额问题，停止后续请求"
+            return dict(record, status="error", error=str(e))
+        if data is None:
+            return dict(record, status="unavailable", error="端点不存在或不可访问；内容未确认")
+        return dict(record, status="ok", data=data)
+
+
+def emit_result(command, args, result, renderer, before):
+    if getattr(args, "format", "markdown") == "json":
+        document = {"schema_version": 1, "command": command, "collected_at": timestamp(),
+                    "request_attempts": REQUEST_ATTEMPTS - before, **result}
+        print(json.dumps(document, ensure_ascii=False, indent=2))
+    else:
+        renderer(result)
+    return 0 if result["status"] == "ok" else 1
+
+
 def collect_search(args):
     queries = [args.query] if isinstance(args.query, str) else args.query
     queries = list(dict.fromkeys(q.strip() for q in queries))
@@ -102,12 +144,13 @@ def collect_search(args):
         params = {"q": query, "per_page": min(args.top, 100)}
         if args.sort != "best":
             params.update(sort=args.sort, order="desc")
-        record = {"id": f"Q{index}", "query": query,
-                  "source_url": API + "/search/repositories?" + urllib.parse.urlencode(params)}
+        record = {"id": f"Q{index}", "query": query, "collected_at": None,
+                  "source_url": source_url("/search/repositories", params)}
         records.append(record)
         if stopped:
             record.update(status="skipped", error=stopped)
             continue
+        record["collected_at"] = timestamp()
         try:
             data = api("/search/repositories", params)
             if data is None:
@@ -120,7 +163,8 @@ def collect_search(args):
         items = data.get("items", [])
         record.update(status="ok", total_count=data.get("total_count"),
                       returned_count=len(items), incomplete_results=data.get("incomplete_results"),
-                      sample_limit=params["per_page"], paginated=False)
+                      sample_limit=params["per_page"], paginated=False,
+                      truncated=data["total_count"] > len(items) if isinstance(data.get("total_count"), int) else None)
         for item in items:
             key = ("id", item["id"]) if item.get("id") is not None else ("name", item["full_name"].lower())
             if key not in repositories:
@@ -159,18 +203,51 @@ def render_search(result):
 
 
 def cmd_search(args):
+    before = REQUEST_ATTEMPTS
     result = collect_search(args)
-    render_search(result)
-    return 0 if result["status"] == "ok" else 1
+    return emit_result("search", args, result, render_search, before)
 
 
-def cmd_inspect(args):
+def collect_inspect(args):
     if args.repo.count("/") != 1:
         die("仓库格式应为 owner/repo")
-    o, r = args.repo.split("/")
-    repo = api(f"/repos/{o}/{r}")
-    if repo is None:
-        die(f"仓库 {args.repo} 不存在或不可访问")
+    base = f"/repos/{args.repo}"
+    collector = EvidenceCollector()
+    result = {"repo": args.repo, "repository": collector.fetch(base)}
+    if result["repository"]["status"] != "ok":
+        return dict(result, status="error")
+    endpoints = [("releases", {"per_page": 5}), ("commits", {"per_page": 15}),
+                 ("contributors", {"per_page": 10}), ("readme", None),
+                 ("issues", {"state": "open", "per_page": min(args.max_issues, 100),
+                             "sort": "updated", "direction": "desc"})]
+    for name, params in endpoints:
+        record = collector.fetch(f"{base}/{name}", params, raw=name == "readme")
+        result[name] = record
+        if name == "readme":
+            data = record["data"]
+            record.update(character_limit=args.readme_chars,
+                          original_characters=len(data) if data is not None else None,
+                          truncated=len(data) > args.readme_chars if data is not None else None)
+            if data is not None:
+                record["data"] = data[:args.readme_chars]
+        else:
+            data = record["data"]
+            record.update(sample_limit=params["per_page"], paginated=False,
+                          returned_count=len(data) if data is not None else None,
+                          limit_reached=len(data) == params["per_page"] if data is not None else None)
+            if name == "issues":
+                record["data"] = [i for i in data if "pull_request" not in i] if data is not None else None
+                record["issue_count"] = len(record["data"]) if data is not None else None
+                record["pull_requests_excluded"] = len(data) - record["issue_count"] if data is not None else None
+    result["status"] = "ok" if all(result[name]["status"] == "ok" for name, _ in endpoints) else "partial"
+    return result
+
+
+def render_inspect(result):
+    if result["repository"]["status"] != "ok":
+        print(f"错误: 仓库 {result['repo']}：{result['repository']['error']}", file=sys.stderr)
+        return
+    repo = result["repository"]["data"]
     print(f"# {repo['full_name']}")
     print(f"{repo.get('description') or ''}\n")
     pushed = repo.get("pushed_at")
@@ -181,9 +258,10 @@ def cmd_inspect(args):
     print(f"license {lic} | archived {'是' if repo.get('archived') else '否'} | "
           f"默认分支 {repo.get('default_branch')} | topics: {', '.join(repo.get('topics') or []) or '-'}\n")
 
-    rel = api(f"/repos/{o}/{r}/releases", {"per_page": 5})
+    rel = result["releases"]["data"]
     if rel is None:
         print("## releases：端点不可访问，发布情况未确认")
+        print(result["releases"]["error"])
     else:
         published = [x for x in rel if x.get("draft") is False and x.get("published_at")]
         published.sort(key=lambda x: x["published_at"], reverse=True)
@@ -196,43 +274,49 @@ def cmd_inspect(args):
             print(f"- {x.get('tag_name')} ({x['published_at'][:10]}) [{kind}] {(x.get('name') or '')}")
     print()
 
-    commits = api(f"/repos/{o}/{r}/commits", {"per_page": 15})
+    commits = result["commits"]["data"]
     if commits:
         dates = [(c.get("commit", {}).get("author", {}).get("date") or "")[:10] for c in commits]
         print(f"## commits（最近 {len(commits)} 条，{dates[-1]} ~ {dates[0]}）")
         for c in commits:
-            msg = (c.get("commit", {}).get("message") or "").splitlines()[0][:70]
+            msg = (c.get("commit", {}).get("message") or "").split("\n", 1)[0][:70]
             d = (c.get("commit", {}).get("author", {}).get("date") or "")[:10]
             print(f"- {d} {msg}")
+    elif commits is None:
+        print(f"## commits：未取得，提交情况未确认；{result['commits']['error']}")
     else:
-        print("## commits：无")
+        print("## commits：当前页为空")
     print()
 
-    contribs = api(f"/repos/{o}/{r}/contributors", {"per_page": 10})
+    contribs = result["contributors"]["data"]
     if contribs:
         names = ", ".join(f"{c.get('login')}({c.get('contributions')})" for c in contribs)
         mark = "（当前页 10 条，是否还有更多未确认）" if len(contribs) == 10 else ""
         print(f"## contributors{mark}: {names}\n")
+    elif contribs is None:
+        print(f"## contributors：未取得，贡献者情况未确认；{result['contributors']['error']}\n")
+    else:
+        print("## contributors：当前页为空\n")
 
-    readme = api(f"/repos/{o}/{r}/readme", raw=True)
-    print(f"## README（前 {args.readme_chars} 字符）")
+    readme = result["readme"]["data"]
+    print(f"## README（前 {result['readme']['character_limit']} 字符）")
     if readme is None:
         print("README 未取得，端点不存在或不可访问；内容未确认")
+        print(result["readme"]["error"])
     elif readme:
-        print(readme[:args.readme_chars])
-        if len(readme) > args.readme_chars:
+        print(readme)
+        if result["readme"]["truncated"]:
             print("\n…（已截断）")
     else:
         print("README 返回空内容")
     print()
 
-    issue_page = api(f"/repos/{o}/{r}/issues",
-                     {"state": "open", "per_page": min(args.max_issues, 100), "sort": "updated", "direction": "desc"})
-    if issue_page is None:
+    issues = result["issues"]["data"]
+    if issues is None:
         print("## open issues：端点不可访问，issue 情况未确认")
+        print(result["issues"]["error"])
         return
-    issues = [i for i in issue_page if "pull_request" not in i]
-    print(f"## open issues（更新倒序样本：API 返回 {len(issue_page)} 条 issue/PR，其中 {len(issues)} 条 issue）")
+    print(f"## open issues（更新倒序样本：API 返回 {result['issues']['returned_count']} 条 issue/PR，其中 {len(issues)} 条 issue）")
     print("仅当前页，未翻页；不能据此判断 issue 总数或问题出现频率。")
     if not issues:
         print("当前页没有 issue 样本，仓库是否存在其他 open issue 未确认。")
@@ -243,12 +327,28 @@ def cmd_inspect(args):
         print(f"- {source} {i['title'][:70]} {labels} 评论{ i.get('comments', 0)} 更新{i.get('updated_at', '')[:10]}")
 
 
-def cmd_rate(_):
-    d = api("/rate_limit")
+def cmd_inspect(args):
+    before = REQUEST_ATTEMPTS
+    result = collect_inspect(args)
+    return emit_result("inspect", args, result, render_inspect, before)
+
+
+def render_rate(result):
+    if result["rate_limit"]["status"] != "ok":
+        print(f"错误: {result['rate_limit']['error']}", file=sys.stderr)
+        return
+    d = result["rate_limit"]["data"]
     for k in ("core", "search"):
         rr = d["resources"][k]
         reset = dt.datetime.fromtimestamp(rr["reset"], dt.timezone.utc).astimezone().strftime("%H:%M:%S")
         print(f"{k}: 剩余 {rr['remaining']}/{rr['limit']}，{reset} 重置")
+
+
+def cmd_rate(args):
+    before = REQUEST_ATTEMPTS
+    record = EvidenceCollector().fetch("/rate_limit")
+    result = {"status": "ok" if record["status"] == "ok" else "error", "rate_limit": record}
+    return emit_result("rate", args, result, render_rate, before)
 
 
 def main():
@@ -264,9 +364,11 @@ def main():
     ps.add_argument("--sort", choices=["stars", "best", "forks", "updated"], default="stars")
     pi = sub.add_parser("inspect", help="拉取单个仓库的维护证据样本（6 次请求，不翻页）")
     pi.add_argument("repo", help="owner/repo")
-    pi.add_argument("--max-issues", type=int, default=20, help="单页 issue/PR 混合样本条数，最多 100（默认 20）")
-    pi.add_argument("--readme-chars", type=int, default=4000)
-    sub.add_parser("rate", help="查看 API 限额")
+    pi.add_argument("--max-issues", type=positive_int, default=20, help="单页 issue/PR 混合样本条数，最多 100（默认 20）")
+    pi.add_argument("--readme-chars", type=positive_int, default=4000)
+    pr = sub.add_parser("rate", help="查看 API 限额")
+    for parser in (ps, pi, pr):
+        parser.add_argument("--format", choices=["markdown", "json"], default="markdown", help="输出格式（默认 markdown）")
     args = p.parse_args()
     before = REQUEST_ATTEMPTS
     try:

@@ -70,7 +70,9 @@ python scripts/gh.py --help
 python scripts/gh.py search "cli note taking" --top 30
 python scripts/gh.py search "cli note taking" --sort best
 python scripts/gh.py search "cli note taking" "terminal notes in:readme" --sort best --top 30
+python scripts/gh.py search "cli note taking" "terminal notes in:readme" --format json
 python scripts/gh.py inspect owner/repo --max-issues 20 --readme-chars 4000
+python scripts/gh.py inspect owner/repo --format json
 python scripts/gh.py rate
 ```
 
@@ -80,7 +82,9 @@ Replace `owner/repo` with a real repository, such as `cli/cli`. Use `python3` on
 | --- | --- | --- |
 | `search "query" ["query" ...]` | Merged Markdown candidate table with repository links, metadata, and matching query IDs | `--top`: per query, default 30, capped at 100; `--sort`: `stars` (default), `best`, `forks`, or `updated` |
 | `inspect owner/repo` | Repository metadata, releases, default-branch commits, contributors, a README excerpt, and open issue samples | `--max-issues`: default 20, capped at 100 mixed issue/PR entries; `--readme-chars`: default 4000 |
-| `rate` | Remaining core/search API quota and reset times | No options |
+| `rate` | Remaining core/search API quota and reset times | `--format` as described below |
+
+All commands accept `--format markdown` (default) or `--format json`.
 
 Use positive values for sample sizes and README length. Set `GITHUB_TOKEN` in the process environment if needed; the script does not read `.env` files or GitHub CLI credentials automatically.
 
@@ -95,6 +99,20 @@ The helper collects evidence; it does not automatically select a shortlist or wr
 Multiple queries are executed separately, then deduplicated by repository ID. The first occurrence supplies the metadata and display order; `Q1`, `Q2`, etc. preserve every matching query. Repeated identical queries (after trimming surrounding whitespace) run once. `--top` applies to each query, not the merged total. Query hit counts are provenance, not suitability scores; overlapping search totals must not be added together.
 
 If a query fails, successful results remain in the output and the command exits with code 1. Query-specific errors allow subsequent queries to continue; connection, authentication, or exhausted rate-limit failures stop remaining queries and mark them as skipped. GitHub's `incomplete_results` flag is surfaced separately; a successful request does not guarantee exhaustive coverage.
+
+### JSON output
+
+```bash
+python scripts/gh.py search "cli note taking" "terminal notes in:readme" --format json > candidates.json
+python scripts/gh.py inspect cli/cli --format json > repository-sample.json
+```
+
+Standard output contains one JSON document; diagnostics and HTTP attempt counts stay on standard error. The common fields are `schema_version` (currently `1`), `command`, `collected_at` (UTC), `request_attempts` (including retries), and `status` (`ok`, `partial`, or `error`). Status describes data retrieval, not exhaustive coverage or evidence quality. API failures still produce JSON and exit code 1; invalid CLI arguments may produce only a diagnostic.
+
+- **Search:** `queries` holds each query's ID, text, source URL, attempt time, status, total/returned counts, sample limit, `truncated`, and GitHub's `incomplete_results`. Failed or skipped queries have an error instead of result counts. `repositories` holds GitHub metadata plus `matched_queries`; `unique_count` counts only collected, deduplicated repositories. `truncated` compares GitHub's total with the returned page; it does not replace the independent `incomplete_results` flag.
+- **Inspection:** `repository`, `releases`, `commits`, `contributors`, `readme`, and `issues` contain `status`, `source_url`, `collected_at`, and `data`. Missing data is `null`, distinct from a successfully returned empty list or string. Section statuses are `ok`, `unavailable`, `error`, or `skipped`. Partial results are retained, with exit code 1 when any section is unavailable or fails.
+- **Samples:** list sections include `sample_limit`, `returned_count`, `paginated: false`, and `limit_reached`. A full page does not prove that another page exists. README includes `character_limit`, `original_characters`, and `truncated`. Issues preserve the mixed API count and `pull_requests_excluded`, while `data` contains only issues. Releases retain their original `draft`, `prerelease`, and publication fields; consumers must apply the publication rules below.
+- **Quota:** `rate_limit.data` contains GitHub's resource quota response with the same source/status metadata. Skipped endpoints have a `null` collection time because no request was made.
 
 ## Research output
 
@@ -134,7 +152,7 @@ Run the existing tests from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The tests mock HTTP/API calls and require no network access or token. They check multi-query deduplication and provenance, partial failures, sampled-evidence interpretation, missing data, PR filtering, and request accounting; they do not validate live GitHub availability or the quality of an agent's full research report.
+The tests mock HTTP/API calls and require no network access or token. They check multi-query deduplication and provenance, JSON parsing and evidence boundaries, partial failures, sampled-evidence interpretation, missing data, PR filtering, and request accounting; they do not validate live GitHub availability or the quality of an agent's full research report.
 
 [Issues](https://github.com/ThinkDonk/github-landscape/issues) and [pull requests](https://github.com/ThinkDonk/github-landscape/pulls) in English or Chinese are welcome. Include the command or research prompt, expected and actual behavior, and source links when reporting an evidence problem. Keep both READMEs aligned when updating user-facing behavior, and add focused regression coverage for script changes. Remove tokens from shared logs.
 

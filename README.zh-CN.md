@@ -69,7 +69,9 @@ python scripts/gh.py --help
 python scripts/gh.py search "cli note taking" --top 30
 python scripts/gh.py search "cli note taking" --sort best
 python scripts/gh.py search "cli note taking" "terminal notes in:readme" --sort best --top 30
+python scripts/gh.py search "cli note taking" "terminal notes in:readme" --format json
 python scripts/gh.py inspect owner/repo --max-issues 20 --readme-chars 4000
+python scripts/gh.py inspect owner/repo --format json
 python scripts/gh.py rate
 ```
 
@@ -79,7 +81,9 @@ python scripts/gh.py rate
 | --- | --- | --- |
 | `search "query" ["query" ...]` | 合并后的 Markdown 候选表，包含仓库链接、元数据与命中查询编号 | `--top`：每条查询默认 30，最多 100；`--sort`：`stars`（默认）、`best`、`forks` 或 `updated` |
 | `inspect owner/repo` | 仓库元数据、发布版本、默认分支提交、贡献者、README 摘要及 open issue 样本 | `--max-issues`：默认 20，最多 100 条 issue/PR 混合条目；`--readme-chars`：默认 4000 |
-| `rate` | core/search API 的剩余额度与重置时间 | 无参数 |
+| `rate` | core/search API 的剩余额度与重置时间 | 支持下文的 `--format` |
+
+所有命令均支持 `--format markdown`（默认）或 `--format json`。
 
 样本条数和 README 长度请使用正数。需要认证时，在进程环境中设置 `GITHUB_TOKEN`；脚本不会自动读取 `.env` 文件或 GitHub CLI 的登录凭据。
 
@@ -94,6 +98,20 @@ python scripts/gh.py inspect cli/cli > repository-sample.md
 多条查询分别执行后按仓库 ID 去重，保留首次出现的元数据与展示顺序，并用 `Q1`、`Q2` 等记录全部命中查询。去除首尾空白后相同的查询只执行一次。`--top` 对每条查询生效，不限制合并后的总数。命中次数仅表示来源，不是适配评分；各查询的结果总数有重叠，不能直接相加。
 
 某条查询失败时，输出仍保留成功结果，命令退出码为 1。查询本身的错误不阻止其他查询；连接、认证或限额耗尽等故障会停止后续查询并标记跳过。GitHub 的 `incomplete_results` 标记会单独提示；请求成功不代表检索覆盖完整。
+
+### JSON 输出
+
+```bash
+python scripts/gh.py search "cli note taking" "terminal notes in:readme" --format json > candidates.json
+python scripts/gh.py inspect cli/cli --format json > repository-sample.json
+```
+
+标准输出包含一个 JSON 文档，诊断与 HTTP 尝试数仍写入标准错误。公共字段包括 `schema_version`（当前为 `1`）、`command`、`collected_at`（UTC）、`request_attempts`（含重试）和 `status`（`ok`、`partial` 或 `error`）。状态描述数据取得情况，不代表覆盖完整或证据质量。API 故障仍输出 JSON，退出码为 1；CLI 参数错误可能仅输出诊断。
+
+- **搜索：**`queries` 保留每条查询的编号、文本、来源 URL、尝试时间、状态、总数/返回数、样本上限、`truncated` 和 GitHub 的 `incomplete_results`。失败或跳过的查询保留错误，不填写结果数量。`repositories` 为 GitHub 元数据加 `matched_queries`；`unique_count` 仅统计实际取得并去重后的仓库。`truncated` 比较 GitHub 总数与本页返回数，不能替代独立的 `incomplete_results` 标记。
+- **检查：**`repository`、`releases`、`commits`、`contributors`、`readme`、`issues` 各自包含 `status`、`source_url`、`collected_at` 和 `data`。未取得的数据为 `null`，与成功返回的空列表或空文本不同。分节状态为 `ok`、`unavailable`、`error` 或 `skipped`。保留已取得的部分结果；任一分节不可访问或失败时退出码为 1。
+- **样本：**列表分节记录 `sample_limit`、`returned_count`、`paginated: false` 和 `limit_reached`。满页不能证明还有下一页。README 记录 `character_limit`、`original_characters` 与 `truncated`。Issues 保留 API 混合返回数和 `pull_requests_excluded`，`data` 仅包含 issue。Releases 保留原始 `draft`、`prerelease` 与发布字段，使用方仍须遵守下文的发布判断规则。
+- **额度：**`rate_limit.data` 保存 GitHub 的资源额度响应，并带有相同的来源/状态信息。跳过的端点未发起请求，采集时间为 `null`。
 
 ## 调研结果包含什么
 
@@ -133,7 +151,7 @@ github-landscape/
 python -m unittest discover -s tests -v
 ```
 
-测试模拟 HTTP/API 调用，不需要联网或 token，覆盖多查询去重与来源保留、部分失败、样本解释、数据缺失、PR 过滤和请求计数；不验证 GitHub 实时可用性，也不代表已经验证智能体完整调研报告的质量。
+测试模拟 HTTP/API 调用，不需要联网或 token，覆盖多查询去重与来源保留、JSON 解析与证据边界、部分失败、样本解释、数据缺失、PR 过滤和请求计数；不验证 GitHub 实时可用性，也不代表已经验证智能体完整调研报告的质量。
 
 欢迎使用中文或英文提交 [Issue](https://github.com/ThinkDonk/github-landscape/issues) 和 [Pull Request](https://github.com/ThinkDonk/github-landscape/pulls)。反馈时请提供命令或调研提示词、预期结果与实际表现；证据判断问题请附来源链接。修改面向用户的行为时同步两份 README，修改脚本时补充有针对性的回归测试。分享日志前请去除 token。
 

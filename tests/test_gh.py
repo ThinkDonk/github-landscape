@@ -55,6 +55,19 @@ class LandscapeTests(unittest.TestCase):
             gh.cmd_inspect(args)
         return stdout.getvalue()
 
+    def json_command(self, arguments, values, expected_exit=0):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(gh.urllib.request, "urlopen", side_effect=values) as fetch:
+            with mock.patch.object(gh.sys, "argv", ["gh.py"] + arguments + ["--format", "json"]):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    if expected_exit:
+                        with self.assertRaises(SystemExit) as error:
+                            gh.main()
+                        self.assertEqual(error.exception.code, expected_exit)
+                    else:
+                        gh.main()
+        return json.loads(stdout.getvalue()), stderr.getvalue(), fetch
+
     def test_pr_only_page_does_not_claim_repository_has_no_issues(self):
         output = self.inspect(issues=[{"number": 9, "pull_request": {}}])
         self.assertIn("1 条 issue/PR，其中 0 条 issue", output)
@@ -197,6 +210,90 @@ class LandscapeTests(unittest.TestCase):
                     with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                         gh.main()
             fetch.assert_not_called()
+
+    def test_json_search_is_parseable_preserves_unicode_and_query_provenance(self):
+        gh.REQUEST_ATTEMPTS = 40  # Output accounting must be scoped to this command.
+        item = dict(repository(), id=1, description="离线 | 笔记\n同步")
+        document, stderr, _ = self.json_command(["search", "笔记", "offline", "--top", "1"], [
+            response({"items": [item], "total_count": 20, "incomplete_results": False}),
+            response({"items": [item], "total_count": 1, "incomplete_results": True}),
+        ])
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["command"], "search")
+        self.assertEqual(document["status"], "ok")
+        self.assertEqual(document["request_attempts"], 2)
+        self.assertTrue(document["collected_at"].endswith("Z"))
+        self.assertEqual(document["repositories"][0]["description"], "离线 | 笔记\n同步")
+        self.assertEqual(document["repositories"][0]["matched_queries"], ["Q1", "Q2"])
+        self.assertTrue(document["queries"][0]["truncated"])
+        self.assertFalse(document["queries"][1]["truncated"])
+        self.assertTrue(document["queries"][1]["incomplete_results"])
+        self.assertIn("HTTP 请求尝试：2 次", stderr)
+
+    def test_json_search_failure_remains_parseable_and_preserves_success(self):
+        document, _, fetch = self.json_command(["search", "notes", "offline", "sync"], [
+            response({"items": [repository()], "total_count": 1}),
+            gh.urllib.error.URLError("offline"),
+        ], expected_exit=1)
+        self.assertEqual(document["status"], "partial")
+        self.assertEqual(document["request_attempts"], 2)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(document["unique_count"], 1)
+        self.assertEqual(document["queries"][2]["status"], "skipped")
+        self.assertIsNone(document["queries"][2]["collected_at"])
+
+    def test_json_inspect_preserves_sample_bounds_sources_and_unknown_data(self):
+        missing = gh.urllib.error.HTTPError("https://api.github.com/example", 404, "missing", {}, io.BytesIO())
+        releases = [{"tag_name": "draft", "draft": True, "published_at": None}]
+        issue = {"number": 7, "title": "Sync", "html_url": "https://github.com/example/project/issues/7"}
+        document, _, _ = self.json_command(["inspect", "example/project", "--readme-chars", "2"], [
+            response(repository()), response(releases), response([]), missing,
+            response("笔记同步"), response([{"number": 8, "pull_request": {}}, issue]),
+        ], expected_exit=1)
+        self.assertEqual(document["status"], "partial")
+        self.assertEqual(document["request_attempts"], 6)
+        self.assertEqual(document["commits"]["data"], [])
+        self.assertEqual(document["commits"]["status"], "ok")
+        self.assertIsNone(document["contributors"]["data"])
+        self.assertEqual(document["contributors"]["status"], "unavailable")
+        self.assertEqual(document["releases"]["data"], releases)
+        self.assertEqual(document["readme"]["data"], "笔记")
+        self.assertTrue(document["readme"]["truncated"])
+        self.assertEqual(document["readme"]["original_characters"], 4)
+        self.assertEqual(document["issues"]["data"], [issue])
+        self.assertEqual(document["issues"]["returned_count"], 2)
+        self.assertEqual(document["issues"]["pull_requests_excluded"], 1)
+        self.assertFalse(document["issues"]["paginated"])
+        self.assertEqual(document["issues"]["sample_limit"], 20)
+        self.assertIn("state=open", document["issues"]["source_url"])
+
+    def test_json_inspect_connection_failure_preserves_earlier_evidence(self):
+        document, _, fetch = self.json_command(["inspect", "example/project"], [
+            response(repository()), response([]), gh.urllib.error.URLError("offline"),
+        ], expected_exit=1)
+        self.assertEqual(document["request_attempts"], 3)
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(document["repository"]["data"]["full_name"], "example/project")
+        self.assertEqual(document["releases"]["data"], [])
+        self.assertEqual(document["commits"]["status"], "error")
+        self.assertEqual(document["readme"]["status"], "skipped")
+        self.assertIsNone(document["readme"]["truncated"])
+        self.assertIsNone(document["issues"]["returned_count"])
+
+    def test_json_missing_repository_emits_one_error_document(self):
+        missing = gh.urllib.error.HTTPError("https://api.github.com/example", 404, "missing", {}, io.BytesIO())
+        document, _, _ = self.json_command(["inspect", "example/project"], [missing], expected_exit=1)
+        self.assertEqual(document["status"], "error")
+        self.assertEqual(document["request_attempts"], 1)
+        self.assertIsNone(document["repository"]["data"])
+        self.assertEqual(document["repository"]["status"], "unavailable")
+
+    def test_json_rate_preserves_resources_and_request_count(self):
+        value = {"resources": {"core": {"limit": 60, "remaining": 30, "reset": 1800000000}}}
+        document, _, _ = self.json_command(["rate"], [response(value)])
+        self.assertEqual(document["command"], "rate")
+        self.assertEqual(document["rate_limit"]["data"], value)
+        self.assertEqual(document["request_attempts"], 1)
 
     def test_missing_metadata_and_readme_do_not_imply_absence(self):
         for readme, expected in ((None, "README 未取得"), ("", "README 返回空内容")):

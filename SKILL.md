@@ -15,11 +15,15 @@ description: 调研 GitHub 上与项目想法或需求相似的公开仓库，�
 python scripts/gh.py search "<query>" --top 30
 python scripts/gh.py search "<query>" --sort best
 python scripts/gh.py search "<query 1>" "<query 2>" --sort best --top 30
+python scripts/gh.py search "<query 1>" "<query 2>" --format json
 python scripts/gh.py inspect owner/repo
+python scripts/gh.py inspect owner/repo --format json
 python scripts/gh.py rate
 ```
 
 `inspect` 返回有限样本：release 页面、默认分支提交、贡献者、README 前缀，以及按更新时间排序的 open issue/PR 页面。它不会翻页，也不是完整仓库审计。报告中的关键判断若依赖被截断的 README、未展示的功能或完整历史，只补查能改变结论的部分。
+
+需要程序复用或保存结构化证据时，三个命令均可用 `--format json`；默认仍为 Markdown。JSON 包含 `schema_version`、UTC 采集时间、来源 URL、实际请求数和取证状态。先检查 `status` 与样本边界，再读取数据：`null` 表示未取得，成功取得的空列表/空文本才表示本次返回为空。`status: ok` 只表示请求成功，不证明覆盖完整。JSON 中 releases 保留原始发布状态，仍需按下文规则判断已发布版本。
 
 ## 搜索与候选选择
 
@@ -64,6 +68,7 @@ python scripts/gh.py rate
 
 - 无重试时，`search` 每条不同查询为 1 次 HTTP 请求，`inspect` 为 6 次，`rate` 为 1 次；每个端点最多尝试 5 次。脚本在标准错误输出本次命令的实际 HTTP 尝试数，包含失败和限速重试，不自动汇总多条命令。
 - 多查询搜索保留成功结果及每条查询状态；有失败或跳过时退出码为 1。连接、认证或限额故障会停止后续查询并标记跳过；查询本身失败则继续其他查询。API 标记 `incomplete_results` 时会提示，不把局部结果当作完整检索。
+- `inspect` 同样保留已取得的部分证据；端点不可访问、失败或跳过时退出码为 1。JSON 模式的 API 故障仍输出可解析的结果，诊断和请求计数写入标准错误；参数错误不保证 JSON 输出。
 - 2–4 次搜索加 3–5 个仓库 inspect 的基线为 20–34 次请求；补查、限额查询和重试另计。这是估算，不是脚本强制限额。用户指定请求预算时，先按此成本缩小范围并预留重试空间，不承诺自动遵守未实现的硬上限。
 - `GITHUB_TOKEN` 可选。限额以响应和 `rate` 输出为准，不假设匿名额度恒定。不要要求用户在对话里发送 token。
 - 遇到权限、限额或连接限制，记录缺失证据并利用已有数据；停止重复失败的请求，不把不可访问解读为项目不存在或没有该能力。
